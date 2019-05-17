@@ -21,26 +21,28 @@
 #include "nat.h"
 
 
-#define RX_RING_SIZE 128
+#define RX_RING_SIZE 		128
 
-#define TX_RING_SIZE 512
+#define TX_RING_SIZE 		512
 
-#define NUM_MBUFS 8191
+#define NUM_MBUFS 			8191
 
-#define MBUF_CACHE_SIZE 250
+#define MBUF_CACHE_SIZE 	250
 
-#define BURST_SIZE 32
+#define BURST_SIZE 			32
 
-#define RING_SIZE 16384
+#define RING_SIZE 			16384
 
 #define MAX_PATTERN_NUM		4
 
-void nat_learning(struct rte_mbuf *single_pkt, struct ether_hdr *eth_hdr, struct ipv4_hdr *ip_hdr, struct icmp_hdr *icmphdr, uint32_t *new_port_id);
-uint16_t get_checksum(const void *const addr, const size_t bytes);
-void nat_rule_timer(__attribute__((unused)) struct rte_timer *tim, __attribute__((unused)) *arg);
+void 		nat_learning(struct rte_mbuf *single_pkt, struct ether_hdr *eth_hdr, struct ipv4_hdr *ip_hdr, struct icmp_hdr *icmphdr, uint32_t *new_port_id);
+uint16_t 	get_checksum(const void *const addr, const size_t bytes);
+void 		nat_rule_timer(__attribute__((unused)) struct rte_timer *tim, __attribute__((unused)) *arg);
+void 		send_arp(__attribute__((unused)) struct rte_timer *tim, uint32_t dst_addr);
 
 typedef struct addr_table {
 	unsigned char 	mac_addr[6];
+	unsigned char 	dst_mac[ETH_ALEN];
 	uint32_t		src_ip;
 	uint32_t		dst_ip;
 	uint16_t		port_id;
@@ -49,9 +51,10 @@ typedef struct addr_table {
 	uint8_t			is_alive;
 }__rte_cache_aligned addr_table_t;
 
-addr_table_t addr_table[65535];
+addr_table_t 			addr_table[65535];
 
-struct rte_timer nat;
+struct rte_timer 		nat,arp;
+struct rte_mempool 		*mbuf_pool;
 
 static const struct rte_eth_conf port_conf_default = {
 	.rxmode = { .max_rx_pkt_len = ETHER_MAX_LEN, },
@@ -60,15 +63,12 @@ static const struct rte_eth_conf port_conf_default = {
 
 };
 
-FILE *fp;
-
 static uint16_t nb_rxd = RX_RING_SIZE;
 static uint16_t nb_txd = TX_RING_SIZE;
 
 unsigned char 	mac_addr[2][6];
 uint32_t 		ip_addr[2];
-unsigned char 	next_mac_addr[2][6] = {{0x1a,0x25,0x4a,0x1e,0xea,0x36}, {0xb6,0xe4,0xce,0xbf,0xfe,0x77}};
-struct rte_ring *rte_ring;
+//struct rte_ring *rte_ring;
 
 struct rte_flow *generate_flow(uint16_t port_id, uint16_t rx_q_udp, uint16_t rx_q_tcp, struct rte_flow_error *error)
 {
@@ -116,7 +116,7 @@ struct rte_flow *generate_flow(uint16_t port_id, uint16_t rx_q_udp, uint16_t rx_
 		eth_spec.dst.addr_bytes[i] = mac_addr[port_id][i];
 		eth_mask.dst.addr_bytes[i] = 0xff;
 	}
-	eth_spec.type = htons(0x0800);
+	eth_spec.type = rte_cpu_to_be_16(0x0800);
 	eth_mask.type = 0xffff;
 	pattern[0].type = RTE_FLOW_ITEM_TYPE_ETH;
 	pattern[0].spec = &eth_spec;
@@ -170,7 +170,7 @@ struct rte_flow *generate_flow(uint16_t port_id, uint16_t rx_q_udp, uint16_t rx_
 		eth_spec.dst.addr_bytes[i] = mac_addr[port_id][i];
 		eth_mask.dst.addr_bytes[i] = 0xff;
 	}
-	eth_spec.type = htons(0x0800);
+	eth_spec.type = rte_cpu_to_be_16(0x0800);
 	eth_mask.type = 0xffff;
 	pattern[0].type = RTE_FLOW_ITEM_TYPE_ETH;
 	pattern[0].spec = &eth_spec;
@@ -200,8 +200,7 @@ struct rte_flow *generate_flow(uint16_t port_id, uint16_t rx_q_udp, uint16_t rx_
 	return flow;
 }
 
-static inline int
-port_init(uint16_t port, struct rte_mempool *mbuf_pool)
+static inline int port_init(uint16_t port, struct rte_mempool *mbuf_pool)
 {
 	struct rte_eth_conf port_conf = port_conf_default;
 	struct rte_eth_dev_info dev_info;
@@ -216,7 +215,6 @@ port_init(uint16_t port, struct rte_mempool *mbuf_pool)
 		port_conf.txmode.offloads |=
 			DEV_TX_OFFLOAD_MBUF_FAST_FREE;
 
-	/*配置端口0,给他分配一个接收队列和一个发送队列*/
 	retval = rte_eth_dev_configure(port, rx_rings, tx_rings, &port_conf);
 	if (retval != 0)
 		return retval;
@@ -253,33 +251,42 @@ int down_icmp_stream(struct rte_mempool *mbuf_pool)
 {
 	uint64_t total_tx;
 	struct rte_mbuf *single_pkt;
+	struct rte_mbuf *pkt[BURST_SIZE];
 	struct icmp_hdr *icmphdr;
 	uint16_t ori_port_id;
 
 	for(;;) {
-		struct rte_mbuf * pkt[BURST_SIZE];
 		total_tx = 0;
-		int i;
 		uint16_t nb_rx = rte_eth_rx_burst(1,0,pkt,BURST_SIZE);
-		if(nb_rx == 0) {
+		if(nb_rx == 0)
 			continue;
-		}
 		struct ether_hdr * eth_hdr;
-		for(i=0;i<nb_rx;i++) {
+		for(int i=0;i<nb_rx;i++) {
 			single_pkt = pkt[i];
 			rte_prefetch0(rte_pktmbuf_mtod(single_pkt, void *));
 			eth_hdr = rte_pktmbuf_mtod(single_pkt,struct ether_hdr*);
-			if (eth_hdr->ether_type == htons(0x0806)) {
+			if (eth_hdr->ether_type == rte_cpu_to_be_16(ARP)) {
 				rte_memcpy(eth_hdr->d_addr.addr_bytes,eth_hdr->s_addr.addr_bytes,6);
 				rte_memcpy(eth_hdr->s_addr.addr_bytes,mac_addr[1],6);
 				struct arp_hdr *arphdr = (struct arp_hdr *)(rte_pktmbuf_mtod(single_pkt, unsigned char *) + sizeof(struct ether_hdr));
-				if (arphdr->arp_op == htons(0x0001) && arphdr->arp_data.arp_tip == ip_addr[1]) {
+				if (arphdr->arp_op == rte_cpu_to_be_16(ARP_OP_REQUEST) && arphdr->arp_data.arp_tip == ip_addr[1]) {
 					rte_memcpy(arphdr->arp_data.arp_tha.addr_bytes,arphdr->arp_data.arp_sha.addr_bytes,6);
 					rte_memcpy(arphdr->arp_data.arp_sha.addr_bytes,mac_addr[1],6);
 					arphdr->arp_data.arp_tip = arphdr->arp_data.arp_sip;
 					arphdr->arp_data.arp_sip = ip_addr[1];
-					arphdr->arp_op = htons(0x0002);
+					arphdr->arp_op = rte_cpu_to_be_16(ARP_OP_REPLY);
 					rte_eth_tx_burst(1,0,&single_pkt,1);
+				}
+				else if (arphdr->arp_op == rte_cpu_to_be_16(ARP_OP_REPLY)) {
+					for(int j=0; j<65536; j++) {
+						if (arphdr->arp_data.arp_sip == addr_table[j].dst_ip) {
+							if (addr_table[j].is_fill == 0) {
+								rte_memcpy(addr_table[j].dst_mac,arphdr->arp_data.arp_sha.addr_bytes,ETH_ALEN);
+								addr_table[j].is_fill = 1;
+							}
+						}
+					}
+					rte_pktmbuf_free(single_pkt);
 				}
 				continue;
 			}
@@ -291,7 +298,7 @@ int down_icmp_stream(struct rte_mempool *mbuf_pool)
 			icmphdr = (struct icmp_hdr *)(rte_pktmbuf_mtod(single_pkt, unsigned char *) + sizeof(struct ether_hdr) + sizeof(struct ipv4_hdr));
 			switch(ip_hdr->next_proto_id) {
 				case IPV4_ICMP:
-					ori_port_id = htons(icmphdr->icmp_ident);
+					ori_port_id = rte_be_to_cpu_16(icmphdr->icmp_ident);
 					rte_memcpy(eth_hdr->d_addr.addr_bytes,addr_table[ori_port_id].mac_addr,6);
 					rte_memcpy(eth_hdr->s_addr.addr_bytes,mac_addr[0],6);
 					ip_hdr->dst_addr = addr_table[ori_port_id].src_ip;
@@ -328,9 +335,8 @@ int down_udp_stream(struct rte_mempool *mbuf_pool)
 	struct ipv4_hdr *ip_hdr;
 	struct udp_hdr *udphdr;
 	uint16_t ori_port_id;
-	uint16_t nb_rx;
+	uint16_t nb_rx, nb_tx;
 	int i;
-	uint16_t nb_tx;
 
 	for(;;) {
 		total_tx = 0;
@@ -348,7 +354,7 @@ int down_udp_stream(struct rte_mempool *mbuf_pool)
 			single_pkt->l3_len = sizeof(struct ipv4_hdr);
 			ip_hdr->hdr_checksum = 0;
 			udphdr = (struct udp_hdr *)(rte_pktmbuf_mtod(single_pkt, unsigned char *) + sizeof(struct ether_hdr) + sizeof(struct ipv4_hdr));
-			ori_port_id = htons(udphdr->dst_port);
+			ori_port_id = rte_be_to_cpu_16(udphdr->dst_port);
 			rte_memcpy(eth_hdr->d_addr.addr_bytes,addr_table[ori_port_id].mac_addr,6);
 			rte_memcpy(eth_hdr->s_addr.addr_bytes,mac_addr[0],6);
 			ip_hdr->dst_addr = addr_table[ori_port_id].src_ip;
@@ -381,8 +387,7 @@ int down_tcp_stream(struct rte_mempool *mbuf_pool)
 	struct tcp_hdr *tcphdr;
 	uint16_t ori_port_id;
 	int i;
-	uint16_t nb_rx;
-	uint16_t nb_tx;
+	uint16_t nb_rx, nb_tx;
 
 	for(;;) {
 		total_tx = 0;
@@ -399,7 +404,8 @@ int down_tcp_stream(struct rte_mempool *mbuf_pool)
 			single_pkt->l2_len = sizeof(struct ether_hdr);
 			single_pkt->l3_len = sizeof(struct ipv4_hdr);
 			ip_hdr->hdr_checksum = 0;
-			tcphdr = (struct tcp_hdr *)(rte_pktmbuf_mtod(single_pkt, unsigned char *) + sizeof(struct ether_hdr) + sizeof(struct ipv4_hdr));				ori_port_id = htons(tcphdr->dst_port);
+			tcphdr = (struct tcp_hdr *)(rte_pktmbuf_mtod(single_pkt, unsigned char *) + sizeof(struct ether_hdr) + sizeof(struct ipv4_hdr));				
+			ori_port_id = rte_be_to_cpu_16(tcphdr->dst_port);
 			rte_memcpy(eth_hdr->d_addr.addr_bytes,addr_table[ori_port_id].mac_addr,6);
 			rte_memcpy(eth_hdr->s_addr.addr_bytes,mac_addr[0],6);
 			ip_hdr->dst_addr = addr_table[ori_port_id].src_ip;
@@ -431,8 +437,7 @@ int up_icmp_stream(struct rte_mempool *mbuf_pool)
 	struct icmp_hdr *icmphdr;
 	uint32_t new_port_id;
 	int i;
-	uint16_t nb_rx;
-	uint16_t nb_tx;
+	uint16_t nb_rx, nb_tx;
 
 	for(;;) {
 		total_tx = 0;
@@ -443,43 +448,46 @@ int up_icmp_stream(struct rte_mempool *mbuf_pool)
 			single_pkt = pkt[i];
 			rte_prefetch0(rte_pktmbuf_mtod(single_pkt, void *));
 			eth_hdr = rte_pktmbuf_mtod(single_pkt,struct ether_hdr*);
-			if (eth_hdr->ether_type == htons(0x0806)) {
+			if (eth_hdr->ether_type == rte_cpu_to_be_16(ARP)) {
 				rte_memcpy(eth_hdr->d_addr.addr_bytes,eth_hdr->s_addr.addr_bytes,6);
 				rte_memcpy(eth_hdr->s_addr.addr_bytes,mac_addr[0],6);
 				struct arp_hdr *arphdr = (struct arp_hdr *)(rte_pktmbuf_mtod(single_pkt, unsigned char *) + sizeof(struct ether_hdr));
-				if (arphdr->arp_op == htons(0x0001) && arphdr->arp_data.arp_tip == ip_addr[0]) {
+				if (arphdr->arp_op == rte_cpu_to_be_16(ARP_OP_REQUEST) && arphdr->arp_data.arp_tip == ip_addr[0]) {
 					rte_memcpy(arphdr->arp_data.arp_tha.addr_bytes,arphdr->arp_data.arp_sha.addr_bytes,6);
 					rte_memcpy(arphdr->arp_data.arp_sha.addr_bytes,mac_addr[0],6);
 					arphdr->arp_data.arp_tip = arphdr->arp_data.arp_sip;
 					arphdr->arp_data.arp_sip = ip_addr[0];
-					arphdr->arp_op = htons(0x0002);
+					arphdr->arp_op = rte_cpu_to_be_16(ARP_OP_REPLY);
 					rte_eth_tx_burst(0,0,&single_pkt,1);
 				}
 				continue;	
 			}
 			else {
 				struct ipv4_hdr *ip_hdr = (struct ipv4_hdr *)(rte_pktmbuf_mtod(single_pkt, unsigned char *) + sizeof(struct ether_hdr));
-				//printf("src ip = %x, dst ip = %x\n", ip_hdr->src_addr, ip_hdr->dst_addr);
 				single_pkt->ol_flags |= PKT_TX_IPV4 | PKT_TX_IP_CKSUM;
 				single_pkt->l2_len = sizeof(struct ether_hdr);
 				single_pkt->l3_len = sizeof(struct ipv4_hdr);
 				ip_hdr->hdr_checksum = 0;
 
 				switch (ip_hdr->next_proto_id) {
-					 case IPV4_ICMP:
-					 		icmphdr = (struct icmp_hdr *)(rte_pktmbuf_mtod(single_pkt, unsigned char *) + sizeof(struct ether_hdr) + sizeof(struct ipv4_hdr));
-					 		nat_icmp_learning(single_pkt,eth_hdr,ip_hdr,icmphdr,&new_port_id);
-					 		rte_memcpy(eth_hdr->d_addr.addr_bytes,next_mac_addr[1],6);
-							rte_memcpy(eth_hdr->s_addr.addr_bytes,mac_addr[1],6);
-							ip_hdr->src_addr = ip_addr[1];
-							icmphdr->icmp_ident = htons(new_port_id);
-							addr_table[new_port_id].is_alive = 10;
-							icmphdr->icmp_cksum = 0;
-							icmphdr->icmp_cksum = get_checksum(icmphdr,single_pkt->data_len - sizeof(struct ipv4_hdr));
+					case IPV4_ICMP:
+					 	icmphdr = (struct icmp_hdr *)(rte_pktmbuf_mtod(single_pkt, unsigned char *) + sizeof(struct ether_hdr) + sizeof(struct ipv4_hdr));
+					 	nat_icmp_learning(single_pkt,eth_hdr,ip_hdr,icmphdr,&new_port_id);
+					 	addr_table[new_port_id].is_alive = 10;
+					 	if (addr_table[new_port_id].is_fill == 0) {
+					 		rte_pktmbuf_free(single_pkt);
+					 		break;
+					 	}
+					 	rte_memcpy(eth_hdr->d_addr.addr_bytes,addr_table[new_port_id].dst_mac,6);
+						rte_memcpy(eth_hdr->s_addr.addr_bytes,mac_addr[1],6);
+						ip_hdr->src_addr = ip_addr[1];
+						icmphdr->icmp_ident = rte_cpu_to_be_16(new_port_id);
+						icmphdr->icmp_cksum = 0;
+						icmphdr->icmp_cksum = get_checksum(icmphdr,single_pkt->data_len - sizeof(struct ipv4_hdr));
 						  
-						  pkt[total_tx++] = single_pkt;
-						  puts("nat icmp at port 0");
-						 break;
+						pkt[total_tx++] = single_pkt;
+						puts("nat icmp at port 0");
+						break;
 					default:
 						  rte_pktmbuf_free(single_pkt);
 						  puts("recv other packet");
@@ -530,11 +538,15 @@ int up_udp_stream(struct rte_mempool *mbuf_pool)
 
 			udphdr = (struct udp_hdr *)(rte_pktmbuf_mtod(single_pkt, unsigned char *) + sizeof(struct ether_hdr) + sizeof(struct ipv4_hdr));
 		 	nat_udp_learning(single_pkt,eth_hdr,ip_hdr,udphdr,&new_port_id);
-		 	rte_memcpy(eth_hdr->d_addr.addr_bytes,next_mac_addr[1],6);
+		 	addr_table[new_port_id].is_alive = 10;
+			if (addr_table[new_port_id].is_fill == 0) {
+				rte_pktmbuf_free(single_pkt);
+				break;
+			}
+		 	rte_memcpy(eth_hdr->d_addr.addr_bytes,addr_table[new_port_id].dst_mac,6);
 			rte_memcpy(eth_hdr->s_addr.addr_bytes,mac_addr[1],6);
 			ip_hdr->src_addr = ip_addr[1];
-			udphdr->src_port = htons(new_port_id);
-			addr_table[new_port_id].is_alive = 10;
+			udphdr->src_port = rte_cpu_to_be_16(new_port_id);
 			udphdr->dgram_cksum = 0;
 							
 			pkt[total_tx++] = single_pkt;
@@ -581,11 +593,15 @@ int up_tcp_stream(struct rte_mempool *mbuf_pool)
 
 			tcphdr = (struct tcp_hdr *)(rte_pktmbuf_mtod(single_pkt, unsigned char *) + sizeof(struct ether_hdr) + sizeof(struct ipv4_hdr));
 			nat_tcp_learning(single_pkt,eth_hdr,ip_hdr,tcphdr,&new_port_id);
-			rte_memcpy(eth_hdr->d_addr.addr_bytes,next_mac_addr[1],6);
+			addr_table[new_port_id].is_alive = 10;
+			if (addr_table[new_port_id].is_fill == 0) {
+				rte_pktmbuf_free(single_pkt);
+				break;
+			}
+			rte_memcpy(eth_hdr->d_addr.addr_bytes,addr_table[new_port_id].dst_mac,6);
 			rte_memcpy(eth_hdr->s_addr.addr_bytes,mac_addr[1],6);
 			ip_hdr->src_addr = ip_addr[1];
-			tcphdr->src_port = htons(new_port_id);
-			addr_table[new_port_id].is_alive = 10;
+			tcphdr->src_port = rte_cpu_to_be_16(new_port_id);
 			tcphdr->cksum = 0;
 						  
 			pkt[total_tx++] = single_pkt;
@@ -605,10 +621,10 @@ int up_tcp_stream(struct rte_mempool *mbuf_pool)
 
 void nat_icmp_learning(struct rte_mbuf *single_pkt, struct ether_hdr *eth_hdr, struct ipv4_hdr *ip_hdr, struct icmp_hdr *icmphdr, uint32_t *new_port_id)
 {
-	*new_port_id = ntohs(icmphdr->icmp_ident + (ip_hdr->src_addr) / 10000);
+	*new_port_id = rte_be_to_cpu_16(icmphdr->icmp_ident + (ip_hdr->src_addr) / 10000);
 	if (*new_port_id > 0xffff)
 		*new_port_id = *new_port_id / 0xffff + 1000;
-		for (int j=1000,shift=0; j<65535; j++) {
+	for (int j=1000,shift=0; j<65535; j++) {
 		if (addr_table[*new_port_id].is_fill == 1) {
 			if (addr_table[*new_port_id].src_ip == ip_hdr->src_addr && addr_table[*new_port_id].dst_ip == ip_hdr->dst_addr ) {
 				puts("nat rule exist");
@@ -618,12 +634,14 @@ void nat_icmp_learning(struct rte_mbuf *single_pkt, struct ether_hdr *eth_hdr, s
 			*new_port_id++;
 		}
 		else {
-			addr_table[*new_port_id].is_fill = 1;
+			//addr_table[*new_port_id].is_fill = 1;
 			addr_table[*new_port_id].shift = shift;
 			break;
 		}
 	}
+	rte_timer_reset(&arp,rte_get_timer_hz(),SINGLE,0,send_arp,ip_hdr->dst_addr);
 	puts("learning new icmp nat rule");
+	send_arp(&arp,ip_hdr->dst_addr);
 	rte_memcpy(addr_table[*new_port_id].mac_addr,eth_hdr->s_addr.addr_bytes,6);
 	addr_table[*new_port_id].src_ip = ip_hdr->src_addr;
 	addr_table[*new_port_id].dst_ip = ip_hdr->dst_addr; 
@@ -632,10 +650,10 @@ void nat_icmp_learning(struct rte_mbuf *single_pkt, struct ether_hdr *eth_hdr, s
 
 void nat_udp_learning(struct rte_mbuf *single_pkt, struct ether_hdr *eth_hdr, struct ipv4_hdr *ip_hdr, struct udp_hdr *udphdr, uint32_t *new_port_id)
 {
-	*new_port_id = ntohs(udphdr->src_port + (ip_hdr->src_addr) / 10000);
+	*new_port_id = rte_be_to_cpu_16(udphdr->src_port + (ip_hdr->src_addr) / 10000);
 	if (*new_port_id > 0xffff)
 		*new_port_id = *new_port_id / 0xffff + 1000;
-		for (int j=1000,shift=0; j<65535; j++) {
+	for (int j=1000,shift=0; j<65535; j++) {
 		if (addr_table[*new_port_id].is_fill == 1) {
 			if (addr_table[*new_port_id].src_ip == ip_hdr->src_addr && addr_table[*new_port_id].dst_ip == ip_hdr->dst_addr ) {
 				//puts("nat rule exist");
@@ -645,12 +663,14 @@ void nat_udp_learning(struct rte_mbuf *single_pkt, struct ether_hdr *eth_hdr, st
 			*new_port_id++;
 		}
 		else {
-			addr_table[*new_port_id].is_fill = 1;
+			//addr_table[*new_port_id].is_fill = 1;
 			addr_table[*new_port_id].shift = shift;
 			break;
 		}
 	}
+	rte_timer_reset(&arp,rte_get_timer_hz(),SINGLE,0,send_arp,ip_hdr->dst_addr);
 	puts("learning new udp nat rule");
+	send_arp(&arp,ip_hdr->dst_addr);
 	rte_memcpy(addr_table[*new_port_id].mac_addr,eth_hdr->s_addr.addr_bytes,6);
 	addr_table[*new_port_id].src_ip = ip_hdr->src_addr;
 	addr_table[*new_port_id].dst_ip = ip_hdr->dst_addr; 
@@ -659,10 +679,10 @@ void nat_udp_learning(struct rte_mbuf *single_pkt, struct ether_hdr *eth_hdr, st
 
 void nat_tcp_learning(struct rte_mbuf *single_pkt, struct ether_hdr *eth_hdr, struct ipv4_hdr *ip_hdr, struct tcp_hdr *tcphdr, uint32_t *new_port_id)
 {
-	*new_port_id = ntohs(tcphdr->src_port + (ip_hdr->src_addr) / 10000);
+	*new_port_id = rte_be_to_cpu_16(tcphdr->src_port + (ip_hdr->src_addr) / 10000);
 	if (*new_port_id > 0xffff)
 		*new_port_id = *new_port_id / 0xffff + 1000;
-		for (int j=1000,shift=0; j<65535; j++) {
+	for (int j=1000,shift=0; j<65535; j++) {
 		if (addr_table[*new_port_id].is_fill == 1) {
 			if (addr_table[*new_port_id].src_ip == ip_hdr->src_addr && addr_table[*new_port_id].dst_ip == ip_hdr->dst_addr ) {
 				//puts("nat rule exist");
@@ -672,12 +692,14 @@ void nat_tcp_learning(struct rte_mbuf *single_pkt, struct ether_hdr *eth_hdr, st
 			*new_port_id++;
 		}
 		else {
-			addr_table[*new_port_id].is_fill = 1;
+			//addr_table[*new_port_id].is_fill = 1;
 			addr_table[*new_port_id].shift = shift;
 			break;
 		}
 	}
 	puts("learning new tcp nat rule");
+	rte_timer_reset(&arp,rte_get_timer_hz(),SINGLE,0,send_arp,ip_hdr->dst_addr);
+	send_arp(&arp,ip_hdr->dst_addr);
 	rte_memcpy(addr_table[*new_port_id].mac_addr,eth_hdr->s_addr.addr_bytes,6);
 	addr_table[*new_port_id].src_ip = ip_hdr->src_addr;
 	addr_table[*new_port_id].dst_ip = ip_hdr->dst_addr; 
@@ -707,25 +729,37 @@ uint16_t get_checksum(const void *const addr, const size_t bytes)
   	return checksum = ~sum;
 }
 
-#if 0
-int ring_buf(struct rte_mempool *mbuf_pool)
+void send_arp(__attribute__((unused)) struct rte_timer *tim, uint32_t dst_addr)
 {
-	//struct rte_mbuf *single_pkt;
-	char *buf = malloc(5);
-	for(;;) {
-		//single_pkt = rte_pktmbuf_alloc(mbuf_pool);
-		uint16_t burst_size = rte_ring_dequeue_burst(rte_ring,&buf, 1, NULL);
-		if (likely(burst_size == 0)) {
-			//puts("123");
-			//rte_pktmbuf_free(single_pkt);
-			continue;
-		}
-		printf("recv %u ring msg\n", burst_size);
-		puts(buf);
-		//rte_pktmbuf_free(single_pkt);
-	}
+	struct rte_mbuf *pkt;
+	struct ether_hdr *eth_hdr;
+	struct arp_hdr *arphdr;
+
+	pkt = rte_pktmbuf_alloc(mbuf_pool);
+	eth_hdr = rte_pktmbuf_mtod(pkt,struct ether_hdr*);
+	for(int i=0; i<ETH_ALEN; i++)
+		eth_hdr->d_addr.addr_bytes[i] = 0xff;
+	rte_memcpy(eth_hdr->s_addr.addr_bytes,mac_addr[1],ETH_ALEN);
+	eth_hdr->ether_type = rte_cpu_to_be_16(ARP);
+
+	arphdr = (struct arp_hdr *)(rte_pktmbuf_mtod(pkt, unsigned char *) + sizeof(struct ether_hdr));
+	arphdr->arp_hrd = rte_cpu_to_be_16(ARP_HRD_ETHER);
+	arphdr->arp_pro = rte_cpu_to_be_16(0x0800);
+	arphdr->arp_hln = 0x6;
+	arphdr->arp_pln = 0x4;
+	arphdr->arp_op = rte_cpu_to_be_16(ARP_OP_REQUEST);
+	rte_memcpy(arphdr->arp_data.arp_sha.addr_bytes,mac_addr[1],ETH_ALEN);
+	arphdr->arp_data.arp_sip = ip_addr[1];
+	for(int i=0; i<ETH_ALEN; i++)
+		arphdr->arp_data.arp_tha.addr_bytes[i] = 0;
+	arphdr->arp_data.arp_tip = dst_addr;
+
+	int pkt_size = sizeof(struct arp_hdr) + sizeof(struct ether_hdr);
+	pkt->data_len = pkt_size;
+	pkt->pkt_len = pkt_size;
+
+	uint16_t nb_tx = rte_eth_tx_burst(1,0,&pkt,1);
 }
-#endif
 
 void nat_rule_timer(__attribute__((unused)) struct rte_timer *tim, __attribute__((unused)) *arg)
 {
@@ -755,30 +789,49 @@ __attribute__((noreturn)) int timer_loop(__attribute__((unused)) void *arg)
 	}
 }
 
+uint32_t convert_ip_to_hex(char addr[])
+{
+    uint32_t 	ip = 0, val;
+    char 		*tok, *ptr;
+
+    tok = strtok(addr,".");
+    while(tok != NULL) {
+        val = strtoul(tok,&ptr,0);
+        ip = (ip << 8) + val;
+        tok = strtok(NULL,".");
+    }
+    return ip;
+}
+
 int main(int argc, char *argv[])
 {
-	struct rte_mempool 		*mbuf_pool;
 	uint16_t 				portid;
 	struct rte_flow 		*flow;
 	struct rte_flow_error 	error;
 
-	int ret = rte_eal_init(argc, argv);
+	int ret = rte_eal_init(argc-3,argv+3);
 	if (ret < 0)
 		rte_exit(EXIT_FAILURE, "initlize fail!");
+
+	if (rte_lcore_count() < 7)
+		rte_exit(EXIT_FAILURE, "We need at least 7 cores.\n");
+	if (rte_eth_dev_count_avail() < 2)
+		rte_exit(EXIT_FAILURE, "We need at least 2 eth ports.\n");
+
+	ip_addr[0] = rte_cpu_to_be_32(convert_ip_to_hex(argv[1]));  //LAN : 192.168.1.102
+	ip_addr[1] = rte_cpu_to_be_32(convert_ip_to_hex(argv[2]));  //WAN : 192.168.2.112
 
 	argc -= ret;
 	argv += ret;
 
-	ip_addr[0] = htonl(0xc0a80166); 
-	ip_addr[1] = htonl(0xc0a80270);
 	memset(addr_table,0,65535*sizeof(addr_table_t));
 	/* Creates a new mempool in memory to hold the mbufs. */
-	mbuf_pool = rte_pktmbuf_pool_create("MBUF_POOL", NUM_MBUFS,
-		MBUF_CACHE_SIZE, 0, RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
+	mbuf_pool = rte_pktmbuf_pool_create("MBUF_POOL",NUM_MBUFS,
+		MBUF_CACHE_SIZE,0,RTE_MBUF_DEFAULT_BUF_SIZE,rte_socket_id());
 
 	if (mbuf_pool == NULL)
 		rte_exit(EXIT_FAILURE, "Cannot create mbuf pool\n");
-	rte_ring = rte_ring_create("state_machine",RING_SIZE,rte_socket_id(),0);
+	//rte_ring = rte_ring_create("state_machine",RING_SIZE,rte_socket_id(),0);
 	/* Initialize all ports. */
 	RTE_ETH_FOREACH_DEV(portid) {
 		if (port_init(portid,mbuf_pool) != 0)
@@ -798,15 +851,16 @@ int main(int argc, char *argv[])
 	}
 	rte_timer_subsystem_init();
 	rte_timer_init(&nat);
+	rte_timer_init(&arp);
 
 	//unsigned lcore_id;
 	//RTE_LCORE_FOREACH_SLAVE(lcore_id) {
-        rte_eal_remote_launch(up_icmp_stream, mbuf_pool, 1);
-        rte_eal_remote_launch(down_icmp_stream, mbuf_pool, 2);
-        rte_eal_remote_launch(up_udp_stream, mbuf_pool, 3);
-        rte_eal_remote_launch(down_udp_stream, mbuf_pool, 4);
-        rte_eal_remote_launch(up_tcp_stream, mbuf_pool, 5);
-        rte_eal_remote_launch(down_tcp_stream, mbuf_pool, 6);
+        rte_eal_remote_launch(up_icmp_stream,mbuf_pool,1);
+        rte_eal_remote_launch(down_icmp_stream,mbuf_pool,2);
+        rte_eal_remote_launch(up_udp_stream,mbuf_pool,3);
+        rte_eal_remote_launch(down_udp_stream,mbuf_pool,4);
+        rte_eal_remote_launch(up_tcp_stream,mbuf_pool,5);
+        rte_eal_remote_launch(down_tcp_stream,mbuf_pool,6);
         //rte_eal_remote_launch(ring_buf,mbuf_pool,4);
     //}
     rte_timer_reset(&nat,rte_get_timer_hz(),PERIODICAL,0,(rte_timer_cb_t)nat_rule_timer,NULL);
