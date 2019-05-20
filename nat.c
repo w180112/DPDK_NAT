@@ -13,29 +13,28 @@
 #include <rte_udp.h>
 #include <rte_tcp.h>
 #include <rte_timer.h>
+#include <rte_version.h>
+#include <rte_bus_pci.h>
 #include <pthread.h>
 #include <string.h>
 #include <stdio.h>
 #include <assert.h>
 #include <linux/if_ether.h>
+#include <linux/ethtool.h>
 #include "nat.h"
 
 
 #define RX_RING_SIZE 		128
-
 #define TX_RING_SIZE 		512
-
 #define NUM_MBUFS 			8191
-
 #define MBUF_CACHE_SIZE 	250
-
 #define BURST_SIZE 			32
-
 #define RING_SIZE 			16384
-
 #define MAX_PATTERN_NUM		4
 
-void 		nat_learning(struct rte_mbuf *single_pkt, struct ether_hdr *eth_hdr, struct ipv4_hdr *ip_hdr, struct icmp_hdr *icmphdr, uint32_t *new_port_id);
+void 		nat_tcp_learning(struct ether_hdr *eth_hdr, struct ipv4_hdr *ip_hdr, struct tcp_hdr *tcphdr, uint32_t *new_port_id);
+void 		nat_udp_learning(struct ether_hdr *eth_hdr, struct ipv4_hdr *ip_hdr, struct udp_hdr *udphdr, uint32_t *new_port_id);
+void 		nat_icmp_learning(struct ether_hdr *eth_hdr, struct ipv4_hdr *ip_hdr, struct icmp_hdr *icmphdr, uint32_t *new_port_id);
 uint16_t 	get_checksum(const void *const addr, const size_t bytes);
 void 		nat_rule_timer(__attribute__((unused)) struct rte_timer *tim, __attribute__((unused)) *arg);
 void 		send_arp(__attribute__((unused)) struct rte_timer *tim, uint32_t dst_addr);
@@ -58,9 +57,9 @@ struct rte_mempool 		*mbuf_pool;
 
 static const struct rte_eth_conf port_conf_default = {
 	.rxmode = { .max_rx_pkt_len = ETHER_MAX_LEN, },
-	.txmode = { .offloads = DEV_TX_OFFLOAD_IPV4_CKSUM ,
-								 DEV_TX_OFFLOAD_UDP_CKSUM, }
-
+	.txmode = { .offloads = DEV_TX_OFFLOAD_IPV4_CKSUM,
+							DEV_TX_OFFLOAD_UDP_CKSUM, 
+							DEV_TX_OFFLOAD_TCP_CKSUM, }
 };
 
 static uint16_t nb_rxd = RX_RING_SIZE;
@@ -76,16 +75,11 @@ struct rte_flow *generate_flow(uint16_t port_id, uint16_t rx_q_udp, uint16_t rx_
 	struct rte_flow_item pattern[MAX_PATTERN_NUM];
 	struct rte_flow_action action[MAX_PATTERN_NUM];
 	struct rte_flow *flow = NULL;
-	struct rte_flow_action_queue queue[2];// = {{ .index = rx_q_tcp },{ .index = rx_q_udp }};
-	struct rte_flow_item_eth eth_spec;
-	struct rte_flow_item_eth eth_mask;
-	struct rte_flow_item_ipv4 ip_spec;
-	struct rte_flow_item_ipv4 ip_mask;
+	struct rte_flow_action_queue queue[2] = {{ .index = rx_q_tcp }, { .index = rx_q_udp }};
+	struct rte_flow_item_eth eth_spec, eth_mask;
+	struct rte_flow_item_ipv4 ip_spec, ip_mask;
 	int res;
 
-	queue[0].index = rx_q_tcp;
-	queue[1].index = rx_q_udp;
-	/* Below are for detecting PPPoE packet */
 	memset(pattern,0,sizeof(pattern));
 	memset(action,0,sizeof(action));
 
@@ -93,7 +87,7 @@ struct rte_flow *generate_flow(uint16_t port_id, uint16_t rx_q_udp, uint16_t rx_
 	 * set the rule attribute.
 	 * in this case only ingress packets will be checked.
 	 */
-	memset(&attr, 0, sizeof(struct rte_flow_attr));
+	memset(&attr,0,sizeof(struct rte_flow_attr));
 	attr.ingress = 1;
 
 	/*
@@ -122,8 +116,8 @@ struct rte_flow *generate_flow(uint16_t port_id, uint16_t rx_q_udp, uint16_t rx_
 	pattern[0].spec = &eth_spec;
 	pattern[0].mask = &eth_mask;
 
-	memset(&ip_spec, 0, sizeof(struct rte_flow_item_ipv4));
-	memset(&ip_mask, 0, sizeof(struct rte_flow_item_ipv4));
+	memset(&ip_spec,0,sizeof(struct rte_flow_item_ipv4));
+	memset(&ip_mask,0,sizeof(struct rte_flow_item_ipv4));
 	ip_spec.hdr.next_proto_id = 0x06;
 	ip_mask.hdr.next_proto_id = 0xff;
 	
@@ -138,8 +132,6 @@ struct rte_flow *generate_flow(uint16_t port_id, uint16_t rx_q_udp, uint16_t rx_
 	if (!res)
 		flow = rte_flow_create(port_id, &attr, pattern, action, error);
 
-	/* below are for icmp packet from LAN to gateway IP */
-
 	memset(pattern,0,sizeof(pattern));
 	memset(action,0,sizeof(action));
 
@@ -147,7 +139,7 @@ struct rte_flow *generate_flow(uint16_t port_id, uint16_t rx_q_udp, uint16_t rx_
 	 * set the rule attribute.
 	 * in this case only ingress packets will be checked.
 	 */
-	memset(&attr, 0, sizeof(struct rte_flow_attr));
+	memset(&attr,0,sizeof(struct rte_flow_attr));
 	attr.ingress = 1;
 
 	/*
@@ -181,8 +173,8 @@ struct rte_flow *generate_flow(uint16_t port_id, uint16_t rx_q_udp, uint16_t rx_
 	 * in this example this is the level we care about
 	 * so we set it according to the parameters.
 	 */
-	memset(&ip_spec, 0, sizeof(struct rte_flow_item_ipv4));
-	memset(&ip_mask, 0, sizeof(struct rte_flow_item_ipv4));
+	memset(&ip_spec,0,sizeof(struct rte_flow_item_ipv4));
+	memset(&ip_mask,0,sizeof(struct rte_flow_item_ipv4));
 	ip_spec.hdr.next_proto_id = 0x11;
 	ip_mask.hdr.next_proto_id = 0xff;
 	
@@ -223,18 +215,16 @@ static inline int port_init(uint16_t port, struct rte_mempool *mbuf_pool)
 	if (retval < 0)
 		rte_exit(EXIT_FAILURE,"Cannot adjust number of descriptors: err=%d, ""port=%d\n", retval, port);
 
-	/* Allocate and set up 1 RX queue per Ethernet port. */
-	for (q = 0; q < rx_rings; q++) {
-		retval = rte_eth_rx_queue_setup(port, q, nb_rxd,
-				rte_eth_dev_socket_id(port), NULL, mbuf_pool);
+	/* Allocate and set up 3 RX queue per Ethernet port. */
+	for(q=0; q<rx_rings; q++) {
+		retval = rte_eth_rx_queue_setup(port,q,nb_rxd,rte_eth_dev_socket_id(port),NULL,mbuf_pool);
 		if (retval < 0)
 			return retval;
 	}
 
-	/* Allocate and set up 1 TX queue per Ethernet port. */
-	for (q = 0; q < tx_rings; q++) {
-		retval = rte_eth_tx_queue_setup(port, q, nb_txd,
-				rte_eth_dev_socket_id(port), NULL);
+	/* Allocate and set up 3 TX queue per Ethernet port. */
+	for(q=0; q<tx_rings; q++) {
+		retval = rte_eth_tx_queue_setup(port,q,nb_txd,rte_eth_dev_socket_id(port),NULL);
 		if (retval < 0)
 			return retval;
 	}
@@ -247,18 +237,17 @@ static inline int port_init(uint16_t port, struct rte_mempool *mbuf_pool)
 	return 0;
 }
 
-int down_icmp_stream(struct rte_mempool *mbuf_pool)
+int down_icmp_stream(void)
 {
-	uint64_t total_tx;
-	struct rte_mbuf *single_pkt;
-	struct rte_mbuf *pkt[BURST_SIZE];
+	uint64_t 		total_tx;
+	struct rte_mbuf *single_pkt, *pkt[BURST_SIZE];
 	struct icmp_hdr *icmphdr;
-	uint16_t ori_port_id;
+	uint16_t 		ori_port_id;
 
 	for(;;) {
 		total_tx = 0;
 		uint16_t nb_rx = rte_eth_rx_burst(1,0,pkt,BURST_SIZE);
-		if(nb_rx == 0)
+		if (nb_rx == 0)
 			continue;
 		struct ether_hdr * eth_hdr;
 		for(int i=0;i<nb_rx;i++) {
@@ -314,7 +303,7 @@ int down_icmp_stream(struct rte_mempool *mbuf_pool)
 					rte_pktmbuf_free(single_pkt);
 			}
 		}
-		if (total_tx > 0) {
+		if (likely(total_tx > 0)) {
 			uint16_t nb_tx = rte_eth_tx_burst(0, 0,pkt, total_tx);
 			if (unlikely(nb_tx < total_tx)) {
 				uint16_t buf;
@@ -326,24 +315,22 @@ int down_icmp_stream(struct rte_mempool *mbuf_pool)
 	return 0;
 }
 
-int down_udp_stream(struct rte_mempool *mbuf_pool)
+int down_udp_stream(void)
 {
-	uint64_t total_tx;
-	struct rte_mbuf *single_pkt;
-	struct rte_mbuf *pkt[BURST_SIZE];
-	struct ether_hdr *eth_hdr;
-	struct ipv4_hdr *ip_hdr;
-	struct udp_hdr *udphdr;
-	uint16_t ori_port_id;
-	uint16_t nb_rx, nb_tx;
-	int i;
+	uint64_t		 	total_tx;
+	struct rte_mbuf 	*single_pkt, *pkt[BURST_SIZE];
+	struct ether_hdr 	*eth_hdr;
+	struct ipv4_hdr 	*ip_hdr;
+	struct udp_hdr 		*udphdr;
+	uint16_t 			ori_port_id;
+	uint16_t 			nb_rx, nb_tx;
+	int 				i;
 
 	for(;;) {
 		total_tx = 0;
 		nb_rx = rte_eth_rx_burst(1, 1,pkt,BURST_SIZE);
-		if(nb_rx == 0) {
+		if (nb_rx == 0)
 			continue;
-		}
 		for(i=0; i<nb_rx; i++) {
 			single_pkt = pkt[i];
 			rte_prefetch0(rte_pktmbuf_mtod(single_pkt, void *));
@@ -365,7 +352,7 @@ int down_udp_stream(struct rte_mempool *mbuf_pool)
 			udphdr->dgram_cksum = 0;
 			pkt[total_tx++] = single_pkt;
 		}
-		if (total_tx > 0) {
+		if (likely(total_tx > 0)) {
 			nb_tx = rte_eth_tx_burst(0, 1,pkt, total_tx);
 			if (unlikely(nb_tx < total_tx)) {
 				uint16_t buf;
@@ -377,24 +364,22 @@ int down_udp_stream(struct rte_mempool *mbuf_pool)
 	return 0;
 }
 
-int down_tcp_stream(struct rte_mempool *mbuf_pool)
+int down_tcp_stream(void)
 {
-	uint64_t total_tx;
-	struct rte_mbuf *single_pkt;
-	struct rte_mbuf *pkt[BURST_SIZE];
-	struct ipv4_hdr *ip_hdr;
-	struct ether_hdr *eth_hdr;
-	struct tcp_hdr *tcphdr;
-	uint16_t ori_port_id;
-	int i;
-	uint16_t nb_rx, nb_tx;
+	uint64_t 			total_tx;
+	struct rte_mbuf 	*single_pkt, *pkt[BURST_SIZE];
+	struct ipv4_hdr 	*ip_hdr;
+	struct ether_hdr 	*eth_hdr;
+	struct tcp_hdr 		*tcphdr;
+	uint16_t 			ori_port_id;
+	int 				i;
+	uint16_t 			nb_rx, nb_tx;
 
 	for(;;) {
 		total_tx = 0;
 		nb_rx = rte_eth_rx_burst(1,2,pkt,BURST_SIZE);
-		if(nb_rx == 0) {
+		if (nb_rx == 0)
 			continue;
-		}
 		for(i=0; i<nb_rx; i++) {
 			single_pkt = pkt[i];
 			rte_prefetch0(rte_pktmbuf_mtod(single_pkt, void *));
@@ -409,14 +394,13 @@ int down_tcp_stream(struct rte_mempool *mbuf_pool)
 			rte_memcpy(eth_hdr->d_addr.addr_bytes,addr_table[ori_port_id].mac_addr,6);
 			rte_memcpy(eth_hdr->s_addr.addr_bytes,mac_addr[0],6);
 			ip_hdr->dst_addr = addr_table[ori_port_id].src_ip;
-			//ip_hdr->src_addr = ip_addr[0];
 			tcphdr->dst_port = addr_table[ori_port_id].port_id;
 			addr_table[ori_port_id].is_alive = 10;
 
 			tcphdr->cksum = 0;
 			pkt[total_tx++] = single_pkt;
 		}
-		if (total_tx > 0) {
+		if (likely(total_tx > 0)) {
 			nb_tx = rte_eth_tx_burst(0,2,pkt,total_tx);
 			if (unlikely(nb_tx < total_tx)) {
 				uint16_t buf;
@@ -428,21 +412,20 @@ int down_tcp_stream(struct rte_mempool *mbuf_pool)
 	return 0;
 }
 
-int up_icmp_stream(struct rte_mempool *mbuf_pool)
+int up_icmp_stream(void)
 {
-	uint64_t total_tx;
-	struct rte_mbuf *single_pkt;
-	struct rte_mbuf *pkt[BURST_SIZE];
-	struct ether_hdr *eth_hdr;
-	struct icmp_hdr *icmphdr;
-	uint32_t new_port_id;
-	int i;
-	uint16_t nb_rx, nb_tx;
+	uint64_t 			total_tx;
+	struct rte_mbuf 	*single_pkt, *pkt[BURST_SIZE];
+	struct ether_hdr 	*eth_hdr;
+	struct icmp_hdr 	*icmphdr;
+	uint32_t 			new_port_id;
+	int 				i;
+	uint16_t 			nb_rx, nb_tx;
 
 	for(;;) {
 		total_tx = 0;
 		nb_rx = rte_eth_rx_burst(0,0,pkt,BURST_SIZE);
-		if(nb_rx == 0)
+		if (nb_rx == 0)
 			continue;
 		for(i=0; i<nb_rx; i++) {
 			single_pkt = pkt[i];
@@ -472,12 +455,12 @@ int up_icmp_stream(struct rte_mempool *mbuf_pool)
 				switch (ip_hdr->next_proto_id) {
 					case IPV4_ICMP:
 					 	icmphdr = (struct icmp_hdr *)(rte_pktmbuf_mtod(single_pkt, unsigned char *) + sizeof(struct ether_hdr) + sizeof(struct ipv4_hdr));
-					 	nat_icmp_learning(single_pkt,eth_hdr,ip_hdr,icmphdr,&new_port_id);
+					 	nat_icmp_learning(eth_hdr,ip_hdr,icmphdr,&new_port_id);
 					 	addr_table[new_port_id].is_alive = 10;
-					 	if (addr_table[new_port_id].is_fill == 0) {
-					 		rte_pktmbuf_free(single_pkt);
-					 		break;
-					 	}
+					 	if (unlikely(addr_table[new_port_id].is_fill == 0)) {
+							rte_pktmbuf_free(single_pkt);
+							break;
+						}
 					 	rte_memcpy(eth_hdr->d_addr.addr_bytes,addr_table[new_port_id].dst_mac,6);
 						rte_memcpy(eth_hdr->s_addr.addr_bytes,mac_addr[1],6);
 						ip_hdr->src_addr = ip_addr[1];
@@ -495,7 +478,7 @@ int up_icmp_stream(struct rte_mempool *mbuf_pool)
 				}
 			}
 		}
-		if (total_tx > 0) {
+		if (likely(total_tx > 0)) {
 			nb_tx = rte_eth_tx_burst(1,0,pkt,total_tx);
 			if (unlikely(nb_tx < total_tx)) {
 				uint16_t buf;
@@ -508,11 +491,10 @@ int up_icmp_stream(struct rte_mempool *mbuf_pool)
 
 }
 
-int up_udp_stream(struct rte_mempool *mbuf_pool)
+int up_udp_stream(void)
 {
 	uint64_t 			total_tx;
-	struct rte_mbuf 	*single_pkt;
-	struct rte_mbuf 	*pkt[BURST_SIZE];
+	struct rte_mbuf 	*single_pkt, *pkt[BURST_SIZE];
 	struct ether_hdr 	*eth_hdr;
 	struct ipv4_hdr 	*ip_hdr;
 	struct udp_hdr 		*udphdr;
@@ -523,23 +505,22 @@ int up_udp_stream(struct rte_mempool *mbuf_pool)
 	for(;;) {
 		total_tx = 0;
 		nb_rx = rte_eth_rx_burst(0,1,pkt,BURST_SIZE);
-		if(nb_rx == 0)
+		if (nb_rx == 0)
 			continue;
 		for(i=0; i<nb_rx; i++) {
 			single_pkt = pkt[i];
 			rte_prefetch0(rte_pktmbuf_mtod(single_pkt, void *));
 			eth_hdr = rte_pktmbuf_mtod(single_pkt,struct ether_hdr*);
 			ip_hdr = (struct ipv4_hdr *)(rte_pktmbuf_mtod(single_pkt, unsigned char *) + sizeof(struct ether_hdr));
-			//printf("src ip = %x, dst ip = %x\n", ip_hdr->src_addr, ip_hdr->dst_addr);
 			single_pkt->ol_flags |= PKT_TX_IPV4 | PKT_TX_IP_CKSUM | PKT_TX_UDP_CKSUM;
 			single_pkt->l2_len = sizeof(struct ether_hdr);
 			single_pkt->l3_len = sizeof(struct ipv4_hdr);
 			ip_hdr->hdr_checksum = 0;
 
 			udphdr = (struct udp_hdr *)(rte_pktmbuf_mtod(single_pkt, unsigned char *) + sizeof(struct ether_hdr) + sizeof(struct ipv4_hdr));
-		 	nat_udp_learning(single_pkt,eth_hdr,ip_hdr,udphdr,&new_port_id);
+		 	nat_udp_learning(eth_hdr,ip_hdr,udphdr,&new_port_id);
 		 	addr_table[new_port_id].is_alive = 10;
-			if (addr_table[new_port_id].is_fill == 0) {
+			if (unlikely(addr_table[new_port_id].is_fill == 0)) {
 				rte_pktmbuf_free(single_pkt);
 				break;
 			}
@@ -551,7 +532,7 @@ int up_udp_stream(struct rte_mempool *mbuf_pool)
 							
 			pkt[total_tx++] = single_pkt;
 		}
-		if (total_tx > 0) {
+		if (likely(total_tx > 0)) {
 			nb_tx = rte_eth_tx_burst(1,1,pkt,total_tx);
 			if (unlikely(nb_tx < total_tx)) {
 				uint16_t buf;
@@ -563,38 +544,37 @@ int up_udp_stream(struct rte_mempool *mbuf_pool)
 	return 0;
 }
 
-int up_tcp_stream(struct rte_mempool *mbuf_pool)
+int up_tcp_stream(void)
 {
 	uint64_t 			total_tx;
-	struct rte_mbuf 	*single_pkt;
+	struct rte_mbuf 	*single_pkt, *pkt[BURST_SIZE];
 	struct ether_hdr 	*eth_hdr;
 	struct ipv4_hdr 	*ip_hdr;
 	struct tcp_hdr 		*tcphdr;
 	uint32_t 			new_port_id;
-	struct rte_mbuf 	*pkt[BURST_SIZE];
 	int 				i;
 	uint16_t 			nb_rx, nb_tx;
 
 	for(;;) {
 		total_tx = 0;
 		nb_rx = rte_eth_rx_burst(0,2,pkt,BURST_SIZE);
-		if(nb_rx == 0)
+		if (nb_rx == 0)
 			continue;
 		for(i=0;i<nb_rx;i++) {
 			single_pkt = pkt[i];
 			rte_prefetch0(rte_pktmbuf_mtod(single_pkt, void *));
 			eth_hdr = rte_pktmbuf_mtod(single_pkt,struct ether_hdr*);
 			ip_hdr = (struct ipv4_hdr *)(rte_pktmbuf_mtod(single_pkt, unsigned char *) + sizeof(struct ether_hdr));
-				//printf("src ip = %x, dst ip = %x\n", ip_hdr->src_addr, ip_hdr->dst_addr);
+			//ip_hdr = rte_pktmbuf_mtod(single_pkt,struct ipv4_hdr *);
 			single_pkt->ol_flags |= PKT_TX_IPV4 | PKT_TX_IP_CKSUM | PKT_TX_TCP_CKSUM;
 			single_pkt->l2_len = sizeof(struct ether_hdr);
 			single_pkt->l3_len = sizeof(struct ipv4_hdr);
 			ip_hdr->hdr_checksum = 0;
 
 			tcphdr = (struct tcp_hdr *)(rte_pktmbuf_mtod(single_pkt, unsigned char *) + sizeof(struct ether_hdr) + sizeof(struct ipv4_hdr));
-			nat_tcp_learning(single_pkt,eth_hdr,ip_hdr,tcphdr,&new_port_id);
+			nat_tcp_learning(eth_hdr,ip_hdr,tcphdr,&new_port_id);
 			addr_table[new_port_id].is_alive = 10;
-			if (addr_table[new_port_id].is_fill == 0) {
+			if (unlikely(addr_table[new_port_id].is_fill == 0)) {
 				rte_pktmbuf_free(single_pkt);
 				break;
 			}
@@ -606,7 +586,7 @@ int up_tcp_stream(struct rte_mempool *mbuf_pool)
 						  
 			pkt[total_tx++] = single_pkt;
 		}
-		if (total_tx > 0) {
+		if (likely(total_tx > 0)) {
 			nb_tx = rte_eth_tx_burst(1,2,pkt,total_tx);
 			if (unlikely(nb_tx < total_tx)) {
 				uint16_t buf;
@@ -619,19 +599,19 @@ int up_tcp_stream(struct rte_mempool *mbuf_pool)
 
 }
 
-void nat_icmp_learning(struct rte_mbuf *single_pkt, struct ether_hdr *eth_hdr, struct ipv4_hdr *ip_hdr, struct icmp_hdr *icmphdr, uint32_t *new_port_id)
+void nat_icmp_learning(struct ether_hdr *eth_hdr, struct ipv4_hdr *ip_hdr, struct icmp_hdr *icmphdr, uint32_t *new_port_id)
 {
 	*new_port_id = rte_be_to_cpu_16(icmphdr->icmp_ident + (ip_hdr->src_addr) / 10000);
 	if (*new_port_id > 0xffff)
 		*new_port_id = *new_port_id / 0xffff + 1000;
 	for (int j=1000,shift=0; j<65535; j++) {
 		if (addr_table[*new_port_id].is_fill == 1) {
-			if (addr_table[*new_port_id].src_ip == ip_hdr->src_addr && addr_table[*new_port_id].dst_ip == ip_hdr->dst_addr ) {
+			if (addr_table[*new_port_id].src_ip == ip_hdr->src_addr && addr_table[*new_port_id].dst_ip == ip_hdr->dst_addr) {
 				puts("nat rule exist");
 				return;
 			}
 			shift++;
-			*new_port_id++;
+			(*new_port_id)++;
 		}
 		else {
 			//addr_table[*new_port_id].is_fill = 1;
@@ -648,19 +628,19 @@ void nat_icmp_learning(struct rte_mbuf *single_pkt, struct ether_hdr *eth_hdr, s
 	addr_table[*new_port_id].port_id = icmphdr->icmp_ident;
 }
 
-void nat_udp_learning(struct rte_mbuf *single_pkt, struct ether_hdr *eth_hdr, struct ipv4_hdr *ip_hdr, struct udp_hdr *udphdr, uint32_t *new_port_id)
+void nat_udp_learning(struct ether_hdr *eth_hdr, struct ipv4_hdr *ip_hdr, struct udp_hdr *udphdr, uint32_t *new_port_id)
 {
 	*new_port_id = rte_be_to_cpu_16(udphdr->src_port + (ip_hdr->src_addr) / 10000);
 	if (*new_port_id > 0xffff)
 		*new_port_id = *new_port_id / 0xffff + 1000;
 	for (int j=1000,shift=0; j<65535; j++) {
-		if (addr_table[*new_port_id].is_fill == 1) {
-			if (addr_table[*new_port_id].src_ip == ip_hdr->src_addr && addr_table[*new_port_id].dst_ip == ip_hdr->dst_addr ) {
+		if (likely(addr_table[*new_port_id].is_fill == 1)) {
+			if (likely(addr_table[*new_port_id].src_ip == ip_hdr->src_addr && addr_table[*new_port_id].dst_ip == ip_hdr->dst_addr)) {
 				//puts("nat rule exist");
 				return;
 			}
 			shift++;
-			*new_port_id++;
+			(*new_port_id)++;
 		}
 		else {
 			//addr_table[*new_port_id].is_fill = 1;
@@ -677,19 +657,19 @@ void nat_udp_learning(struct rte_mbuf *single_pkt, struct ether_hdr *eth_hdr, st
 	addr_table[*new_port_id].port_id = udphdr->src_port;
 }
 
-void nat_tcp_learning(struct rte_mbuf *single_pkt, struct ether_hdr *eth_hdr, struct ipv4_hdr *ip_hdr, struct tcp_hdr *tcphdr, uint32_t *new_port_id)
+void nat_tcp_learning(struct ether_hdr *eth_hdr, struct ipv4_hdr *ip_hdr, struct tcp_hdr *tcphdr, uint32_t *new_port_id)
 {
 	*new_port_id = rte_be_to_cpu_16(tcphdr->src_port + (ip_hdr->src_addr) / 10000);
 	if (*new_port_id > 0xffff)
 		*new_port_id = *new_port_id / 0xffff + 1000;
 	for (int j=1000,shift=0; j<65535; j++) {
-		if (addr_table[*new_port_id].is_fill == 1) {
-			if (addr_table[*new_port_id].src_ip == ip_hdr->src_addr && addr_table[*new_port_id].dst_ip == ip_hdr->dst_addr ) {
+		if (likely(addr_table[*new_port_id].is_fill == 1)) {
+			if (likely(addr_table[*new_port_id].src_ip == ip_hdr->src_addr && addr_table[*new_port_id].dst_ip == ip_hdr->dst_addr)) {
 				//puts("nat rule exist");
 				return;
 			}
 			shift++;
-			*new_port_id++;
+			(*new_port_id)++;
 		}
 		else {
 			//addr_table[*new_port_id].is_fill = 1;
@@ -713,8 +693,8 @@ uint16_t get_checksum(const void *const addr, const size_t bytes)
 	uint16_t 		checksum;
 	size_t 			nleft;
 
-	assert (addr);
-	assert (bytes > 8 - 1);
+	assert(addr);
+	assert(bytes > 8 - 1);
 	word = (const uint16_t *)addr;
 	nleft = bytes;
   
@@ -731,9 +711,9 @@ uint16_t get_checksum(const void *const addr, const size_t bytes)
 
 void send_arp(__attribute__((unused)) struct rte_timer *tim, uint32_t dst_addr)
 {
-	struct rte_mbuf *pkt;
-	struct ether_hdr *eth_hdr;
-	struct arp_hdr *arphdr;
+	struct rte_mbuf 	*pkt;
+	struct ether_hdr 	*eth_hdr;
+	struct arp_hdr 		*arphdr;
 
 	pkt = rte_pktmbuf_alloc(mbuf_pool);
 	eth_hdr = rte_pktmbuf_mtod(pkt,struct ether_hdr*);
@@ -803,11 +783,75 @@ uint32_t convert_ip_to_hex(char addr[])
     return ip;
 }
 
+int rte_ethtool_get_drvinfo(uint16_t port_id, struct ethtool_drvinfo *drvinfo)
+{
+	struct rte_eth_dev_info dev_info;
+	struct rte_dev_reg_info reg_info;
+	const struct rte_pci_device *pci_dev;
+	const struct rte_bus *bus = NULL;
+	int n;
+	int ret;
+
+	if (drvinfo == NULL)
+		return -EINVAL;
+
+	RTE_ETH_VALID_PORTID_OR_ERR_RET(port_id, -ENODEV);
+
+	ret = rte_eth_dev_fw_version_get(port_id, drvinfo->fw_version,
+			      sizeof(drvinfo->fw_version));
+	if (ret < 0)
+		printf("firmware version get error: (%s)\n", strerror(-ret));
+	else if (ret > 0)
+		printf("Insufficient fw version buffer size, "
+		       "the minimum size should be %d\n", ret);
+
+	memset(&dev_info, 0, sizeof(dev_info));
+	rte_eth_dev_info_get(port_id, &dev_info);
+
+	snprintf(drvinfo->driver, sizeof(drvinfo->driver), "%s",
+		dev_info.driver_name);
+	snprintf(drvinfo->version, sizeof(drvinfo->version), "%s",
+		rte_version());
+	/* TODO: replace bus_info by rte_devargs.name */
+	if (dev_info.device)
+		bus = rte_bus_find_by_device(dev_info.device);
+	if (bus && !strcmp(bus->name, "pci")) {
+		pci_dev = RTE_DEV_TO_PCI(dev_info.device);
+		snprintf(drvinfo->bus_info, sizeof(drvinfo->bus_info),
+			"%04x:%02x:%02x.%x",
+			pci_dev->addr.domain, pci_dev->addr.bus,
+			pci_dev->addr.devid, pci_dev->addr.function);
+	} 
+	else {
+		snprintf(drvinfo->bus_info, sizeof(drvinfo->bus_info), "N/A");
+	}
+
+	memset(&reg_info, 0, sizeof(reg_info));
+	rte_eth_dev_get_reg_info(port_id, &reg_info);
+	n = reg_info.length;
+	if (n > 0)
+		drvinfo->regdump_len = n;
+	else
+		drvinfo->regdump_len = 0;
+
+	n = rte_eth_dev_get_eeprom_length(port_id);
+	if (n > 0)
+		drvinfo->eedump_len = n;
+	else
+		drvinfo->eedump_len = 0;
+
+	drvinfo->n_stats = sizeof(struct rte_eth_stats) / sizeof(uint64_t);
+	drvinfo->testinfo_len = 0;
+
+	return 0;
+}
+
 int main(int argc, char *argv[])
 {
 	uint16_t 				portid;
 	struct rte_flow 		*flow;
 	struct rte_flow_error 	error;
+	struct ethtool_drvinfo 	info;
 
 	int ret = rte_eal_init(argc-3,argv+3);
 	if (ret < 0)
@@ -834,6 +878,14 @@ int main(int argc, char *argv[])
 	//rte_ring = rte_ring_create("state_machine",RING_SIZE,rte_socket_id(),0);
 	/* Initialize all ports. */
 	RTE_ETH_FOREACH_DEV(portid) {
+		memset(&info, 0, sizeof(info));
+		if (rte_ethtool_get_drvinfo(portid,&info)) {
+			printf("Error getting info for port %i\n", portid);
+			return -1;
+		}
+		printf("Port %i driver: %s (ver: %s)\n", portid, info.driver, info.version);
+		printf("firmware-version: %s\n", info.fw_version);
+		printf("bus-info: %s\n", info.bus_info);
 		if (port_init(portid,mbuf_pool) != 0)
 			rte_exit(EXIT_FAILURE, "Cannot init port %"PRIu8 "\n",portid);
 	}
@@ -855,12 +907,12 @@ int main(int argc, char *argv[])
 
 	//unsigned lcore_id;
 	//RTE_LCORE_FOREACH_SLAVE(lcore_id) {
-        rte_eal_remote_launch(up_icmp_stream,mbuf_pool,1);
-        rte_eal_remote_launch(down_icmp_stream,mbuf_pool,2);
-        rte_eal_remote_launch(up_udp_stream,mbuf_pool,3);
-        rte_eal_remote_launch(down_udp_stream,mbuf_pool,4);
-        rte_eal_remote_launch(up_tcp_stream,mbuf_pool,5);
-        rte_eal_remote_launch(down_tcp_stream,mbuf_pool,6);
+        rte_eal_remote_launch((lcore_function_t *)up_icmp_stream,NULL,1);
+        rte_eal_remote_launch((lcore_function_t *)down_icmp_stream,NULL,2);
+        rte_eal_remote_launch((lcore_function_t *)up_udp_stream,NULL,3);
+        rte_eal_remote_launch((lcore_function_t *)down_udp_stream,NULL,4);
+        rte_eal_remote_launch((lcore_function_t *)up_tcp_stream,NULL,5);
+        rte_eal_remote_launch((lcore_function_t *)down_tcp_stream,NULL,6);
         //rte_eal_remote_launch(ring_buf,mbuf_pool,4);
     //}
     rte_timer_reset(&nat,rte_get_timer_hz(),PERIODICAL,0,(rte_timer_cb_t)nat_rule_timer,NULL);
