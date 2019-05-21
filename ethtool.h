@@ -1,0 +1,1 @@
+extern int rte_ethtool_get_drvinfo(uint16_t port_id, struct ethtool_drvinfo *drvinfo);
