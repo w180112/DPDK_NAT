@@ -5,7 +5,7 @@
 APP = nat
 
 # all source are stored in SRCS-y
-SRCS-y := nat.c mellanox_nat.c mellanox_flow.c ethtool.c nat_learning.c
+SRCS-y := nat.c mlx5_nat.c mlx5_flow.c ethtool.c nat_learning.c ixgbe_82599_flow.c
 
 # Build using pkg-config variables if possible
 $(shell pkg-config --exists libdpdk)

@@ -22,8 +22,9 @@
 #include <linux/ethtool.h>
 #include "nat.h"
 #include "ethtool.h"
-#include "mellanox_nat.h"
-#include "mellanox_flow.h"
+#include "mlx5_nat.h"
+#include "mlx5_flow.h"
+#include "ixgbe_82599_flow.h"
 #include "nat_learning.h"
 
 
@@ -71,8 +72,8 @@ static inline int port_init(uint16_t port, uint8_t vendor_id, struct rte_mempool
 			tx_rings = 3;
 			break;
 		case VENDOR_INTEL:
-			rx_rings = 1;
-			tx_rings = 1;
+			rx_rings = 2;
+			tx_rings = 2;
 			break;
 		default:
 			rx_rings = 1;
@@ -232,12 +233,12 @@ int main(int argc, char *argv[])
 		case VENDOR_MELLANOX:
 			if (rte_lcore_count() < 7)
 				rte_exit(EXIT_FAILURE, "We need at least 7 cores.\n");
-			flow = generate_flow(0,1,2,&error);
+			flow = generate_flow_mlx5(0,1,2,&error);
 			if (!flow) {
 				printf("Flow can't be created %d message: %s\n", error.type, error.message ? error.message : "(no stated reason)");
 				rte_exit(EXIT_FAILURE, "error in creating flow");
 			}
-			flow = generate_flow(1,1,2,&error);
+			flow = generate_flow_mlx5(1,1,2,&error);
 			if (!flow) {
 				printf("Flow can't be created %d message: %s\n", error.type, error.message ? error.message : "(no stated reason)");
 				rte_exit(EXIT_FAILURE, "error in creating flow");
@@ -248,7 +249,24 @@ int main(int argc, char *argv[])
         	rte_eal_remote_launch((lcore_function_t *)down_udp_stream,NULL,4);
         	rte_eal_remote_launch((lcore_function_t *)up_tcp_stream,NULL,5);
         	rte_eal_remote_launch((lcore_function_t *)down_tcp_stream,NULL,6);
+        	break;
 		case VENDOR_INTEL:
+			if (rte_lcore_count() < 5)
+				rte_exit(EXIT_FAILURE, "We need at least 5 cores.\n");
+			flow = generate_flow_ixgbe_82599(0,1,&error);
+			if (!flow) {
+				printf("Flow can't be created %d message: %s\n", error.type, error.message ? error.message : "(no stated reason)");
+				rte_exit(EXIT_FAILURE, "error in creating flow");
+			}
+			flow = generate_flow_ixgbe_82599(1,1,&error);
+			if (!flow) {
+				printf("Flow can't be created %d message: %s\n", error.type, error.message ? error.message : "(no stated reason)");
+				rte_exit(EXIT_FAILURE, "error in creating flow");
+			}
+			rte_eal_remote_launch((lcore_function_t *)up_icmp_stream,NULL,1);
+        	rte_eal_remote_launch((lcore_function_t *)down_icmp_stream,NULL,2);
+        	//rte_eal_remote_launch((lcore_function_t *)up_udp_tcp_stream,NULL,3);
+        	//rte_eal_remote_launch((lcore_function_t *)down_udp_tcp_stream,NULL,4);
 			break;
 		default:
 			;
