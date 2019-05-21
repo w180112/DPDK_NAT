@@ -1,1 +1,0 @@
-extern struct rte_flow *	generate_flow(uint16_t port_id, uint16_t rx_q_udp, uint16_t rx_q_tcp, struct rte_flow_error *error);
