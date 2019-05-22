@@ -24,15 +24,20 @@
 #include "ethtool.h"
 #include "mlx5_nat.h"
 #include "mlx5_flow.h"
+#include "ixgbe_82599_nat.h"
 #include "ixgbe_82599_flow.h"
 #include "nat_learning.h"
-
 
 #define RX_RING_SIZE 		128
 #define TX_RING_SIZE 		512
 #define NUM_MBUFS 			8191
 #define MBUF_CACHE_SIZE 	250
 #define RING_SIZE 			16384
+
+#define IPV4_UDP 				17
+#define IPV4_TCP 				6
+#define IPV4_ICMP 			1
+#define ARP 					0x0806
 
 uint32_t 							convert_ip_to_hex(char addr[]);
 static void 						nat_rule_timer(__attribute__((unused)) struct rte_timer *tim, __attribute__((unused)) void *arg);
@@ -67,11 +72,11 @@ static inline int port_init(uint16_t port, uint8_t vendor_id, struct rte_mempool
 	uint16_t q;
 
 	switch(vendor_id) {
-		case VENDOR_MELLANOX:
+		case VENDOR_MLX5:
 			rx_rings = 3;
 			tx_rings = 3;
 			break;
-		case VENDOR_INTEL:
+		case VENDOR_IXGBE_82599:
 			rx_rings = 2;
 			tx_rings = 2;
 			break;
@@ -161,9 +166,9 @@ uint32_t convert_ip_to_hex(char addr[])
 void vendor_init(void)
 {
 	nic_vendor[0].vendor = "net_mlx5";
-	nic_vendor[0].vendor_id = VENDOR_MELLANOX;
+	nic_vendor[0].vendor_id = VENDOR_MLX5;
 	nic_vendor[1].vendor = "net_ixgbe";
-	nic_vendor[1].vendor_id = VENDOR_INTEL;
+	nic_vendor[1].vendor_id = VENDOR_IXGBE_82599;
 	nic_vendor[2].vendor = "net_others";
 	nic_vendor[2].vendor_id = VENDOR_OTHERS;
 }
@@ -230,7 +235,7 @@ int main(int argc, char *argv[])
 	rte_timer_init(&arp);
 
 	switch(vendor_id) {
-		case VENDOR_MELLANOX:
+		case VENDOR_MLX5:
 			if (rte_lcore_count() < 7)
 				rte_exit(EXIT_FAILURE, "We need at least 7 cores.\n");
 			flow = generate_flow_mlx5(0,1,2,&error);
@@ -243,14 +248,14 @@ int main(int argc, char *argv[])
 				printf("Flow can't be created %d message: %s\n", error.type, error.message ? error.message : "(no stated reason)");
 				rte_exit(EXIT_FAILURE, "error in creating flow");
 			}
-			rte_eal_remote_launch((lcore_function_t *)up_icmp_stream,NULL,1);
-        	rte_eal_remote_launch((lcore_function_t *)down_icmp_stream,NULL,2);
-        	rte_eal_remote_launch((lcore_function_t *)up_udp_stream,NULL,3);
-        	rte_eal_remote_launch((lcore_function_t *)down_udp_stream,NULL,4);
-        	rte_eal_remote_launch((lcore_function_t *)up_tcp_stream,NULL,5);
-        	rte_eal_remote_launch((lcore_function_t *)down_tcp_stream,NULL,6);
+			rte_eal_remote_launch((lcore_function_t *)up_icmp_stream_mlx5,NULL,1);
+        	rte_eal_remote_launch((lcore_function_t *)down_icmp_stream_mlx5,NULL,2);
+        	rte_eal_remote_launch((lcore_function_t *)up_udp_stream_mlx5,NULL,3);
+        	rte_eal_remote_launch((lcore_function_t *)down_udp_stream_mlx5,NULL,4);
+        	rte_eal_remote_launch((lcore_function_t *)up_tcp_stream_mlx5,NULL,5);
+        	rte_eal_remote_launch((lcore_function_t *)down_tcp_stream_mlx5,NULL,6);
         	break;
-		case VENDOR_INTEL:
+		case VENDOR_IXGBE_82599:
 			if (rte_lcore_count() < 5)
 				rte_exit(EXIT_FAILURE, "We need at least 5 cores.\n");
 			flow = generate_flow_ixgbe_82599(0,1,&error);
@@ -263,10 +268,10 @@ int main(int argc, char *argv[])
 				printf("Flow can't be created %d message: %s\n", error.type, error.message ? error.message : "(no stated reason)");
 				rte_exit(EXIT_FAILURE, "error in creating flow");
 			}
-			rte_eal_remote_launch((lcore_function_t *)up_icmp_stream,NULL,1);
-        	rte_eal_remote_launch((lcore_function_t *)down_icmp_stream,NULL,2);
-        	//rte_eal_remote_launch((lcore_function_t *)up_udp_tcp_stream,NULL,3);
-        	//rte_eal_remote_launch((lcore_function_t *)down_udp_tcp_stream,NULL,4);
+			rte_eal_remote_launch((lcore_function_t *)up_icmp_stream_ixgbe_82599,NULL,1);
+        	rte_eal_remote_launch((lcore_function_t *)down_icmp_stream_ixgbe_82599,NULL,2);
+        	rte_eal_remote_launch((lcore_function_t *)up_udp_tcp_stream_ixgbe_82599,NULL,3);
+        	rte_eal_remote_launch((lcore_function_t *)down_udp_tcp_stream_ixgbe_82599,NULL,4);
 			break;
 		default:
 			;
