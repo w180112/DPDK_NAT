@@ -1,3 +1,4 @@
 #define VENDOR_MLX5  		0
 #define VENDOR_IXGBE_82599	1
-#define VENDOR_OTHERS		2
+#define VENDOR_IXGBE_VF		2
+#define VENDOR_OTHERS		3

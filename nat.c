@@ -27,6 +27,7 @@
 #include "ixgbe_82599_nat.h"
 #include "ixgbe_82599_flow.h"
 #include "nat_learning.h"
+#include "others_nat.h"
 
 #define RX_RING_SIZE 		128
 #define TX_RING_SIZE 		512
@@ -274,7 +275,8 @@ int main(int argc, char *argv[])
         	rte_eal_remote_launch((lcore_function_t *)down_udp_tcp_stream_ixgbe_82599,NULL,4);
 			break;
 		default:
-			;
+			rte_eal_remote_launch((lcore_function_t *)up_stream_others,NULL,1);
+        	rte_eal_remote_launch((lcore_function_t *)down_stream_others,NULL,2);
 	}
 
 	//unsigned lcore_id;

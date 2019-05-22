@@ -20,7 +20,7 @@ to compile
 
 Then 
 	```
-	$ ./build/nat <LAN gw IP> <WAN gw IP> <dpdk eal options>
+	$ ./build/nat <LAN gw IP> <WAN IP> <dpdk eal options>
 	```
 e.g. 
 	```
@@ -36,11 +36,11 @@ To remove the binary file
 
 ##Test environment : 
 
-	1.CentOS 7.5 KVM with Mellanox CX3, CX4 Lx
-	2.AMD Ryzen 2700, 32GB ram
+	1.CentOS 7.5 KVM with Mellanox CX4 Lx, Intel X520
+	2.AMD Ryzen 2700, 32GB ram/DELL POWEREDGE R630
 	4.Intel DPDK 18.11
 
 ##TODO : 
 
 	1.VLAN support
-	2.Multiple users/devices support
+	2.Multiple WAN interface support
